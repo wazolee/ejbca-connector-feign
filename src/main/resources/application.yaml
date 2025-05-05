@@ -1,0 +1,13 @@
+server:
+  port: 8080
+
+ejbca:
+  api:
+    base-url: https://localhost:8443/ejbca/ejbca-rest-api
+  mtls:
+    client-cert-path: classpath:client-cert.pem
+    client-key-path: classpath:client-key.pem
+
+spring:
+  application:
+    name: ejbca-client

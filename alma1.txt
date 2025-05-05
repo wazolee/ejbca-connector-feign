@@ -1,0 +1,540 @@
+Az alábbiakban egy részletes példakódot és magyarázatot adok egy Spring Boot alkalmazásról, amely egy Keyfactor EJBCA konténer REST API-jához csatlakozik egy WebClient segítségével. A kód egy tanúsítványigénylési (certificate enrollment) folyamatot valósít meg, és figyelembe veszi az EJBCA REST API sajátosságait, például az mTLS autentikációt és a JSON formátumú kéréseket. A kódot lépésről lépésre magyarázom, és a lehető legteljesebb képet nyújtom a konfigurációról, a függőségekről és a használatról.
+
+---
+
+### **1. Projekt áttekintése**
+A Spring Boot alkalmazás célja, hogy egy EJBCA REST API-val kommunikáljon, konkrétan egy tanúsítvány igénylésére (enrollment) fókuszálva. Az alkalmazás:
+- **Spring WebClient**-et használ az API hívásokhoz.
+- **mTLS autentikációt** alkalmaz, mivel az EJBCA REST API ezt megköveteli.
+- **JSON formátumú** kéréseket küld és válaszokat fogad.
+- **Docker környezetben** futó EJBCA konténerhez csatlakozik.
+- **Hibakezelést** és naplózást tartalmaz a robusztus működés érdekében.
+
+Az EJBCA REST API dokumentációja alapján (https://docs.keyfactor.com) a tanúsítványigényléshez a `/ejbca/ejbca-controller-api/v1/certificate/enrollkeystore` végpontot használjuk, amely JSON kérést vár, és PKCS#12 formátumú keystore-t ad vissza.
+
+---
+
+### **2. Előfeltételek**
+- **Java 17** vagy újabb (Spring Boot 3.x kompatibilitás miatt).
+- **Maven** build eszköz.
+- **Docker** az EJBCA konténer futtatásához.
+- **EJBCA konténer** telepítve és konfigurálva (lásd: https://docs.keyfactor.com).
+- **Kliens tanúsítvány** (PEM formátumban) és privát kulcs az mTLS autentikációhoz.
+- **EJBCA adminisztrátori hozzáférés** a REST API engedélyezéséhez (System Configuration → Protocol Configuration → Enable REST endpoints).
+
+---
+
+### **3. Projekt felépítése**
+A projekt Maven alapú, és a következő struktúrával rendelkezik:
+
+```
+spring-boot-ejbca-client/
+├── src/
+│   ├── main/
+│   │   ├── java/
+│   │   │   └── com/
+│   │   │       └── example/
+│   │   │           └── ejbca/
+│   │   │               ├── config/
+│   │   │               │   └── WebClientConfig.java
+│   │   │               ├── dto/
+│   │   │               │   ├── EnrollKeystoreRequest.java
+│   │   │               │   └── EnrollKeystoreResponse.java
+│   │   │               ├── service/
+│   │   │               │   └── EjbcaService.java
+│   │   │               ├── controller/
+│   │   │               │   └── EjbcaController.java
+│   │   │               └── Application.java
+│   │   ├── resources/
+│   │       ├── application.yml
+│   │       ├── client-cert.pem
+│   │       └── client-key.pem
+│   └── test/
+├── pom.xml
+└── README.md
+```
+
+---
+
+### **4. Függőségek (pom.xml)**
+
+A `pom.xml` fájl tartalmazza a szükséges függőségeket a Spring Boot, WebClient, és JSON kezeléséhez.
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>spring-boot-ejbca-client</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>Spring Boot EJBCA Client</name>
+    <description>Spring Boot application with WebClient for EJBCA REST API</description>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.4</version>
+        <relativePath/>
+    </parent>
+
+    <properties>
+        <java.version>17</java.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot Web Starter (includes WebClient) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Spring Boot Actuator for health checks -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Lombok for reducing boilerplate code -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Jackson for JSON processing -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- Spring Boot Test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+**Magyarázat**:
+- `spring-boot-starter-web`: Tartalmazza a WebClientet és a REST kontroller támogatást.
+- `spring-boot-starter-actuator`: Egészségügyi végpontokat biztosít (`/actuator/health`).
+- `lombok`: Csökkenti a boilerplate kódot (getterek, setterek).
+- `jackson-databind`: JSON kezeléshez szükséges.
+- Java 17 kompatibilitást állítunk be a Spring Boot 3.x miatt.
+
+---
+
+### **5. Alkalmazás konfiguráció (application.yml)**
+
+Az `application.yml` fájlban definiáljuk az EJBCA REST API végpontját és az mTLS tanúsítványok elérési útját.
+
+```yaml
+server:
+  port: 8080
+
+ejbca:
+  api:
+    base-url: https://localhost:8443/ejbca/ejbca-controller-api
+  mtls:
+    client-cert-path: classpath:client-cert.pem
+    client-key-path: classpath:client-key.pem
+
+spring:
+  application:
+    name: ejbca-client
+```
+
+**Magyarázat**:
+- `server.port`: Az alkalmazás 8080-as porton fut.
+- `ejbca.api.base-url`: Az EJBCA REST API alap URL-je (állítsd be a saját konténered hostname-jára/portjára).
+- `ejbca.mtls`: A kliens tanúsítvány és privát kulcs elérési útja (ezek a `src/main/resources` mappában vannak).
+- A `classpath:` prefix azt jelzi, hogy a fájlok a resources mappában találhatók.
+
+---
+
+### **6. WebClient konfiguráció (WebClientConfig.java)**
+
+A `WebClientConfig` osztály felelős az mTLS autentikációval ellátott WebClient létrehozásáért.
+
+```x-java-source
+package com.example.ejbca.config;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.http.client.reactive.ClientHttpConnector;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.tcp.SslProvider;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
+import java.io.InputStream;
+import java.security.KeyStore;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.security.PrivateKey;
+import java.security.KeyFactory;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Base64;
+
+@Configuration
+public class WebClientConfig {
+
+    @Value("${ejbca.api.base-url}")
+    private String baseUrl;
+
+    @Value("${ejbca.mtls.client-cert-path}")
+    private Resource clientCert;
+
+    @Value("${ejbca.mtls.client-key-path}")
+    private Resource clientKey;
+
+    @Bean
+    public WebClient ejbcaWebClient() throws Exception {
+        // Load client certificate
+        CertificateFactory certFactory = CertificateFactory.getInstance("X.509");
+        X509Certificate cert;
+        try (InputStream certInputStream = clientCert.getInputStream()) {
+            cert = (X509Certificate) certFactory.generateCertificate(certInputStream);
+        }
+
+        // Load private key
+        String keyContent;
+        try (InputStream keyInputStream = clientKey.getInputStream()) {
+            keyContent = new String(keyInputStream.readAllBytes())
+                    .replace("-----BEGIN PRIVATE KEY-----", "")
+                    .replace("-----END PRIVATE KEY-----", "")
+                    .replaceAll("\\s", "");
+        }
+        byte[] keyBytes = Base64.getDecoder().decode(keyContent);
+        PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(keyBytes);
+        PrivateKey privateKey = KeyFactory.getInstance("RSA").generatePrivate(keySpec);
+
+        // Create KeyStore and load client certificate and key
+        KeyStore keyStore = KeyStore.getInstance("JKS");
+        keyStore.load(null, null);
+        keyStore.setKeyEntry("client", privateKey, "changeit".toCharArray(), new java.security.cert.Certificate[]{cert});
+
+        // Initialize KeyManagerFactory
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(keyStore, "changeit".toCharArray());
+
+        // Initialize SSLContext
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(kmf.getKeyManagers(), null, null);
+
+        // Configure HttpClient with SSL
+        HttpClient httpClient = HttpClient.create()
+                .secure(sslSpec -> sslSpec.sslContext(sslContext));
+
+        // Create WebClient
+        ClientHttpConnector connector = new ReactorClientHttpConnector(httpClient);
+        return WebClient.builder()
+                .baseUrl(baseUrl)
+                .clientConnector(connector)
+                .defaultHeader("Content-Type", "application/json")
+                .build();
+    }
+}
+```
+
+**Magyarázat**:
+- A `WebClientConfig` betölti a kliens tanúsítványt (`client-cert.pem`) és a privát kulcsot (`client-key.pem`).
+- A tanúsítvány és kulcs segítségével egy `KeyStore`-t hoz létre, amelyet az mTLS autentikációhoz használ.
+- Az `SSLContext` inicializálása biztosítja, hogy a WebClient mTLS-t használjon az EJBCA API hívások során.
+- A `WebClient` alapértelmezett `Content-Type: application/json` fejlécet állít be, mivel az EJBCA API ezt várja.
+- A `baseUrl` az `application.yml`-ből származik, így könnyen módosítható.
+
+---
+
+### **7. DTO osztályok (EnrollKeystoreRequest.java, EnrollKeystoreResponse.java)**
+
+A DTO (Data Transfer Object) osztályok a kérés és válasz JSON struktúráját modellezik.
+
+#### **EnrollKeystoreRequest.java**
+Ez a kérés testét reprezentálja az `/enrollkeystore` végponthoz.
+
+```x-java-source
+package com.example.ejbca.dto;
+
+import lombok.Data;
+
+@Data
+public class EnrollKeystoreRequest {
+    private String username;
+    private String password;
+    private String keyAlg;
+    private String keySpec;
+}
+```
+
+**Magyarázat**:
+- A mezők (`username`, `password`, `keyAlg`, `keySpec`) snake_case formátumban vannak, ahogy az EJBCA API megköveteli.
+- A `@Data` annotáció (Lombok) generálja a gettereket, settereket és a `toString` metódust.
+
+#### **EnrollKeystoreResponse.java**
+Ez a válasz testét reprezentálja.
+
+```x-java-source
+package com.example.ejbca.dto;
+
+import lombok.Data;
+
+@Data
+public class EnrollKeystoreResponse {
+    private String keystore;
+    private String certificate;
+}
+```
+
+**Magyarázat**:
+- Az EJBCA API a válaszban egy Base64 kódolású PKCS#12 keystore-t és a tanúsítványt adja vissza.
+- A `@Data` annotáció itt is a boilerplate kód csökkentésére szolgál.
+
+---
+
+### **8. Szolgáltatás osztály (EjbcaService.java)**
+
+Az `EjbcaService` osztály kezeli az EJBCA REST API hívásokat.
+
+```x-java-source
+package com.example.ejbca.service;
+
+import com.example.ejbca.dto.EnrollKeystoreRequest;
+import com.example.ejbca.dto.EnrollKeystoreResponse;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+
+@Service
+public class EjbcaService {
+
+    private final WebClient webClient;
+
+    public EjbcaService(WebClient ejbcaWebClient) {
+        this.webClient = ejbcaWebClient;
+    }
+
+    public Mono<EnrollKeystoreResponse> enrollKeystore(EnrollKeystoreRequest request) {
+        return webClient.post()
+                .uri("/v1/certificate/enrollkeystore")
+                .bodyValue(request)
+                .retrieve()
+                .bodyToMono(EnrollKeystoreResponse.class)
+                .doOnError(throwable -> {
+                    throw new RuntimeException("Failed to enroll keystore: " + throwable.getMessage(), throwable);
+                });
+    }
+}
+```
+
+**Magyarázat**:
+- A `WebClient` injektálódik a konstruktoron keresztül.
+- Az `enrollKeystore` metódus egy POST kérést küld a `/v1/certificate/enrollkeystore` végpontra.
+- A `Mono` reaktív típusú, ami aszinkron műveleteket támogat.
+- Hiba esetén a `doOnError` egy `RuntimeException`-t dob részletes üzenettel.
+
+---
+
+### **9. REST kontroller (EjbcaController.java)**
+
+A `EjbcaController` egy REST végpontot biztosít az alkalmazás teszteléséhez.
+
+```x-java-source
+package com.example.ejbca.controller;
+
+import com.example.ejbca.dto.EnrollKeystoreRequest;
+import com.example.ejbca.dto.EnrollKeystoreResponse;
+import com.example.ejbca.service.EjbcaService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Mono;
+
+@RestController
+@RequestMapping("/api/ejbca")
+public class EjbcaController {
+
+    private final EjbcaService ejbcaService;
+
+    public EjbcaController(EjbcaService ejbcaService) {
+        this.ejbcaService = ejbcaService;
+    }
+
+    @PostMapping("/enroll-keystore")
+    public Mono<EnrollKeystoreResponse> enrollKeystore(@RequestBody EnrollKeystoreRequest request) {
+        return ejbcaService.enrollKeystore(request);
+    }
+}
+```
+
+**Magyarázat**:
+- A `/api/ejbca/enroll-keystore` végpont fogadja a JSON kéréseket, és továbbítja azokat az `EjbcaService`-nek.
+- A `@RestController` és `@RequestMapping` annotációk REST API-t definiálnak.
+- A válasz `Mono<EnrollKeystoreResponse>` típusú, ami aszinkron módon adja vissza az eredményt.
+
+---
+
+### **10. Fő alkalmazás osztály (Application.java)**
+
+Ez az alkalmazás belépési pontja.
+
+```x-java-source
+package com.example.ejbca;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
+```
+
+**Magyarázat**:
+- A `@SpringBootApplication` annotáció engedélyezi az automatikus konfigurációt és a komponens szkennelést.
+- A `main` metódus indítja el a Spring Boot alkalmazást.
+
+---
+
+### **11. Példa kliens tanúsítvány és kulcs**
+
+Helyezd el a következő fájlokat a `src/main/resources` mappába:
+
+- **client-cert.pem**: A kliens tanúsítvány PEM formátumban.
+- **client-key.pem**: A hozzá tartozó privát kulcs PEM formátumban.
+
+Példa tartalom (teszteléshez generálj saját tanúsítványt):
+
+**client-cert.pem**:
+```
+-----BEGIN CERTIFICATE-----
+MIID... (tanúsítvány tartalma)
+-----END CERTIFICATE-----
+```
+
+**client-key.pem**:
+```
+-----BEGIN PRIVATE KEY-----
+MIIE... (privát kulcs tartalma)
+-----END PRIVATE KEY-----
+```
+
+**Fontos**: A tanúsítványt és kulcsot az EJBCA adminisztrátori felületén (RA Web) keresztül kell generálnod, például a SuperAdmin tanúsítványként.
+
+---
+
+### **12. EJBCA konténer beállítása**
+
+Az EJBCA konténer futtatásához használd a következő Docker parancsot:
+
+```bash
+docker pull keyfactor/ejbca-ce
+docker run -it --rm -p 80:8080 -p 443:8443 -h localhost -e TLS_SETUP_ENABLED="true" keyfactor/ejbca-ce
+```
+
+**Lépések**:
+1. Nyisd meg az EJBCA adminisztrátori felületét: `https://localhost/ejbca/adminweb`.
+2. Engedélyezd a REST API-t: System Configuration → Protocol Configuration → Enable "REST Certificate Management".
+3. Generálj egy SuperAdmin tanúsítványt az RA Web felületen (lásd: https://docs.keyfactor.com).
+
+---
+
+### **13. Alkalmazás tesztelése**
+
+1. **Indítsd el az alkalmazást**:
+   ```bash
+   mvn spring-boot:run
+   ```
+
+2. **Teszt kérés küldése**:
+   Használj cURL-t vagy Postmant a `/api/ejbca/enroll-keystore` végpont teszteléséhez.
+
+   **Példa cURL parancs**:
+   ```bash
+   curl -X POST http://localhost:8080/api/ejbca/enroll-keystore \
+   -H "Content-Type: application/json" \
+   -d '{
+       "username": "testUser",
+       "password": "foo123",
+       "key_alg": "RSA",
+       "key_spec": "2048"
+   }'
+   ```
+
+   **Várt válasz**:
+   ```json
+   {
+       "keystore": "<Base64 encoded PKCS#12>",
+       "certificate": "<Base64 encoded certificate>"
+   }
+   ```
+
+---
+
+### **14. Hibakezelés és naplózás**
+
+- **Hibakezelés**: A `EjbcaService` osztály `doOnError` blokkja minden WebClient hibát elkap, és `RuntimeException`-t dob részletes üzenettel.
+- **Naplózás**: A Spring Boot beépített naplózási rendszere (SLF4J) használható. Például adj hozzá egy `log.error` hívást a `EjbcaService`-ben a hibák naplózásához:
+  ```java
+  import org.slf4j.Logger;
+  import org.slf4j.LoggerFactory;
+
+  private static final Logger log = LoggerFactory.getLogger(EjbcaService.class);
+
+  public Mono<EnrollKeystoreResponse> enrollKeystore(EnrollKeystoreRequest request) {
+      return webClient.post()
+              .uri("/v1/certificate/enrollkeystore")
+              .bodyValue(request)
+              .retrieve()
+              .bodyToMono(EnrollKeystoreResponse.class)
+              .doOnError(throwable -> {
+                  log.error("Failed to enroll keystore: {}", throwable.getMessage(), throwable);
+                  throw new RuntimeException("Failed to enroll keystore: " + throwable.getMessage(), throwable);
+              });
+  }
+  ```
+
+---
+
+### **15. További megjegyzések**
+
+- **Biztonság**: A kliens tanúsítvány és kulcs érzékeny adatok, ezért éles környezetben titkosítsd őket (például Spring Vault segítségével).
+- **Skálázhatóság**: A WebClient reaktív, így nagy terhelés esetén is hatékony.
+- **Tesztelés**: Adj hozzá egységteszteket a `src/test` mappába, például a `EjbcaService` osztályhoz MockWebServer segítségével.
+- **Dokumentáció**: Az EJBCA REST API Swagger JSON fájlját importálhatod a Swagger UI-ba a végpontok részletes dokumentációjához (lásd: https://docs.keyfactor.com).
+
+---
+
+### **16. Források**
+- EJBCA REST API dokumentáció: https://docs.keyfactor.com[](https://docs.keyfactor.com/ejbca/latest/ejbca-controller-interface)
+- Spring WebClient dokumentáció: https://docs.spring.io/spring-framework/docs/current/reference/html/web-reactive.html
+- Keyfactor EJBCA GitHub: https://github.com/Keyfactor[](https://github.com/Keyfactor/ejbca-easy-controller-client)
+
+Ez a kód és magyarázat egy teljes értékű Spring Boot alkalmazást nyújt, amely integrálható egy EJBCA konténer REST API-jával. Ha további részletekre vagy specifikus kiegészítésekre van szükséged, jelezd!
